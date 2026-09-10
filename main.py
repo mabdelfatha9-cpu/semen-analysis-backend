@@ -1,22 +1,24 @@
 """
 FastAPI backend for Mono Chrome Semen Analysis Assist.
 Powered by Mono Chrome — FOR IVD SOLUTIONS
+Includes self-learning feedback collection for future YOLO training.
 """
 
 import os
 import shutil
 import tempfile
+import time
 import uuid
-from typing import List
+from typing import List, Optional
 
 import cv2
-import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.calibration import CalibrationParams, concentration_million_per_ml
 from app.detector import detect_objects
+from app.learning_store import LabeledSample, append_label, list_labels, save_image, stats as learning_stats
 from app.report import build_report
 from app.tracker import analyze_motility
 from app.video_processing import extract_frames, extract_sequential_frames, frame_dimensions
@@ -25,7 +27,7 @@ WHO_TOTAL_MOTILITY_LOWER_LIMIT_PERCENT = 42.0
 WHO_PROGRESSIVE_MOTILITY_LOWER_LIMIT_PERCENT = 30.0
 WHO_NORMAL_FORMS_LOWER_LIMIT_PERCENT = 4.0
 
-app = FastAPI(title="Mono Chrome Semen Analysis API", version="0.2.0")
+app = FastAPI(title="Mono Chrome Semen Analysis API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,6 +74,13 @@ class MorphologyResponse(BaseModel):
     warnings: List[str]
 
 
+class FeedbackResponse(BaseModel):
+    ok: bool
+    sampleId: str
+    message: str
+    libraryStats: dict
+
+
 @app.get("/")
 def root():
     return {
@@ -79,7 +88,76 @@ def root():
         "service": "mono-chrome-semen-analysis",
         "powered_by": "Mono Chrome",
         "docs": "/docs",
+        "learning": "/learning/stats",
     }
+
+
+@app.get("/learning/stats")
+def get_learning_stats():
+    """How many labeled reviews are stored for future YOLO training."""
+    return learning_stats()
+
+
+@app.get("/learning/labels")
+def get_learning_labels(limit: int = 100):
+    return {"labels": list_labels(limit=limit)}
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+async def submit_feedback(
+    sample_id: str = Form(...),
+    estimated_concentration: Optional[float] = Form(None),
+    estimated_normal_forms_percent: Optional[float] = Form(None),
+    human_concentration: Optional[float] = Form(None),
+    human_normal_forms_percent: Optional[float] = Form(None),
+    human_progressive_motility_percent: Optional[float] = Form(None),
+    reviewer_note: Optional[str] = Form(None),
+    microns_per_pixel: Optional[float] = Form(None),
+    chamber_depth_microns: Optional[float] = Form(None),
+    image: Optional[UploadFile] = File(None),
+):
+    """
+    Technician review → self-learning library.
+    Optional image attachment is stored for later YOLO annotation/training.
+    """
+    has_image = False
+    if image is not None and image.filename:
+        data = await image.read()
+        if data:
+            suffix = ".jpg"
+            name = (image.filename or "").lower()
+            if name.endswith(".png"):
+                suffix = ".png"
+            elif name.endswith(".webp"):
+                suffix = ".webp"
+            save_image(sample_id, data, suffix=suffix)
+            has_image = True
+
+    sample = LabeledSample(
+        sample_id=sample_id,
+        timestamp_epoch=time.time(),
+        estimated_concentration=estimated_concentration,
+        estimated_normal_forms_percent=estimated_normal_forms_percent,
+        human_concentration=human_concentration,
+        human_normal_forms_percent=human_normal_forms_percent,
+        human_progressive_motility_percent=human_progressive_motility_percent,
+        reviewer_note=reviewer_note,
+        has_image=has_image,
+        microns_per_pixel=microns_per_pixel,
+        chamber_depth_microns=chamber_depth_microns,
+    )
+    append_label(sample)
+    st = learning_stats()
+
+    return FeedbackResponse(
+        ok=True,
+        sampleId=sample_id,
+        message=(
+            "تم حفظ المراجعة في مكتبة التعلم الذاتي. "
+            f"الإجمالي الآن: {st.get('total_labels', 0)} عينة."
+        ),
+        libraryStats=st,
+    )
 
 
 @app.post("/calibrate", response_model=CalibrationResponse)
@@ -159,7 +237,6 @@ async def analyze_concentration_image(
     chamber_depth_microns: float = Form(...),
     dilution_factor: float = Form(1.0),
 ):
-    """Concentration from a single still microscope image."""
     if microns_per_pixel <= 0 or chamber_depth_microns <= 0:
         raise HTTPException(status_code=400, detail="Calibration values must be positive.")
 
@@ -258,11 +335,6 @@ async def analyze_motility_endpoint(
 
 @app.post("/analyze/morphology", response_model=MorphologyResponse)
 async def analyze_morphology(image: UploadFile = File(...)):
-    """
-    Prototype morphology estimate from classical shape features.
-    Real clinical morphology needs stained slides + trained models + expert labels
-    (self-learning path: accumulate technician corrections from the app).
-    """
     sample_id = str(uuid.uuid4())
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -286,7 +358,6 @@ async def analyze_morphology(image: UploadFile = File(...)):
                 ],
             )
 
-        # Heuristic: circularity in mid-range as proxy for "more normal-looking" heads.
         normalish = sum(1 for o in objects if 0.55 <= o.circularity <= 0.95)
         normal_pct = 100.0 * normalish / len(objects)
 
